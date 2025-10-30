@@ -217,47 +217,46 @@ for fold, (train_index, val_index) in enumerate(kf.split(train_supervised_datase
 
     for epoch in range(num_epochs_phase):
         model.train()
-        total_loss = 0
+        total_loss = 0.0
 
-        # ===================== 有标签数据 =====================
-        for images, masks in train_loader:
-            images = images.to(device)
-            if masks is not None:
-                masks = masks.to(device)
-
-            outputs = model(images)
-            loss_supervised = supervised_loss(outputs, masks)
+        # 使用 zip 同步有标签和无标签数据
+        for (imgs_l, masks), (imgs_u, _) in zip(train_loader, train_unsupervised_loader):
+            imgs_l, masks = imgs_l.to(device), masks.to(device)
+            imgs_u = imgs_u.to(device)
 
             optimizer.zero_grad()
-            loss_supervised.backward()
+
+            # ---- 有标签监督损失 ----
+            out_sup = model(imgs_l)
+            if isinstance(out_sup, list):
+                out_sup = sum(out_sup)
+            loss_sup = supervised_loss(out_sup, masks)
+
+            # ---- 无标签一致性损失（logits 空间） ----
+            aug1, t1 = get_random_augmentation(imgs_u)
+            aug2, t2 = get_random_augmentation(imgs_u)
+
+            out1 = model(aug1)
+            out2 = model(aug2)
+            if isinstance(out1, list):
+                out1 = sum(out1)
+                out2 = sum(out2)
+
+            out1_inv = inverse_augmentation(out1, t1)
+            out2_inv = inverse_augmentation(out2, t2)
+            loss_cons = torch.mean((out1_inv - out2_inv) ** 2)
+
+            # ---- 合并反向传播 ----
+            loss = loss_sup + lambda_u * loss_cons
+            loss.backward()
             optimizer.step()
 
-            total_loss += loss_supervised.item()
-
-        # ===================== 无标签数据 =====================
-        for images, _ in train_unsupervised_loader:
-            images = images.to(device)
-            augmented_images1, augmentations1 = get_random_augmentation(images)
-            augmented_images2, augmentations2 = get_random_augmentation(images)
-
-            outputs_1 = model(augmented_images1)
-            outputs_1_restored = inverse_augmentation(outputs_1, augmentations1)
-
-            outputs_2 = model(augmented_images2)
-            outputs_2_restored = inverse_augmentation(outputs_2, augmentations2)
-
-            consistency_loss = torch.mean((outputs_1_restored - outputs_2_restored) ** 2)
-
-            optimizer.zero_grad()
-            consistency_loss.backward()
-            optimizer.step()
-
-            total_loss += consistency_loss.item()  # 可选：加权 total_loss += 0.5 * consistency_loss.item()
+            total_loss += loss.item()
 
         scheduler.step()
+        avg_loss = total_loss / len(train_loader)
+        print(f"Fold {fold+1} | Epoch [{epoch+1}/{num_epochs_phase}] | Total Loss: {avg_loss:.4f}")
 
-        avg_loss = total_loss / (len(train_loader) + len(train_unsupervised_loader))
-        print(f"Epoch [{epoch + 1}/{num_epochs_phase}], Loss: {avg_loss:.4f}")
 
         # ===================== 验证步骤 =====================
         model.eval()
