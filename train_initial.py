@@ -237,8 +237,6 @@ for fold, (train_index, val_index) in enumerate(kf.split(train_supervised_datase
         # ===================== 无标签数据 =====================
         for images, _ in train_unsupervised_loader:
             images = images.to(device)
-
-            # 保持训练模式，去掉 no_grad，使梯度可传播
             augmented_images1, augmentations1 = get_random_augmentation(images)
             augmented_images2, augmentations2 = get_random_augmentation(images)
 
@@ -270,8 +268,7 @@ for fold, (train_index, val_index) in enumerate(kf.split(train_supervised_datase
                 images = images.to(device)
                 masks = masks.to(device)
 
-                output1, output2, output3, output4 = model(images)
-                outputs = output1 + output2 + output3 + output4
+                output = model(images)
 
                 val_loss = supervised_loss(outputs, masks)
                 total_val_loss += val_loss.item()
