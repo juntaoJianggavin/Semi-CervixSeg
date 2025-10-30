@@ -202,14 +202,6 @@ unsupervised_loss = SupervisedLoss().cuda()
 for fold, (train_index, val_index) in enumerate(kf.split(train_supervised_dataset)):
     if fold > 0:
         break
-    train_files = [
-        os.path.join(train_supervised_dataset.image_dir, train_supervised_dataset.images[i]) 
-        for i in train_index
-    ]
-    val_files = [
-        os.path.join(train_supervised_dataset.image_dir, train_supervised_dataset.images[i]) 
-        for i in val_index
-    ]
 
     train_subset = torch.utils.data.Subset(train_supervised_dataset, train_index)
     val_subset = torch.utils.data.Subset(train_supervised_dataset, val_index)
@@ -217,75 +209,89 @@ for fold, (train_index, val_index) in enumerate(kf.split(train_supervised_datase
     train_loader = DataLoader(train_subset, batch_size=16, shuffle=True, collate_fn=custom_collate)
     val_loader = DataLoader(val_subset, batch_size=16, shuffle=False, collate_fn=custom_collate)
     train_unsupervised_loader = DataLoader(train_unsupervised_dataset, batch_size=16, shuffle=True, collate_fn=custom_collate)
+
     print(f"Starting Fold {fold + 1}")
     fold_best_mean_dice = 0
     fold_model_path = f"best_fold{fold + 1}.pth" 
     fold_last_model_path = f"last_fold{fold + 1}.pth"
+
     for epoch in range(num_epochs_phase):
         model.train()
         total_loss = 0
+
+        # ===================== 有标签数据 =====================
         for images, masks in train_loader:
             images = images.to(device)
             if masks is not None:
                 masks = masks.to(device)
-            if masks is not None:
-                outputs = model(images)
-                loss = supervised_loss(outputs, masks)
-            else:
-                loss = 0 
+
+            outputs = model(images)
+            loss_supervised = supervised_loss(outputs, masks)
 
             optimizer.zero_grad()
-            loss.backward()
+            loss_supervised.backward()
             optimizer.step()
-            total_loss += loss.item()
 
-        scheduler.step()
+            total_loss += loss_supervised.item()
 
-        # 处理无标签数据
-        model.eval()
-        unsupervised_loss = 0
+        # ===================== 无标签数据 =====================
         for images, _ in train_unsupervised_loader:
             images = images.to(device)
 
-            with torch.no_grad():
-                augmented_images1, augmentations1 = get_random_augmentation(images)  # 第一次增强
-                augmented_images2, augmentations2 = get_random_augmentation(images)
-                outputs_1 = model(augmented_images1)
-                outputs_1_restored = inverse_augmentation(outputs_1, augmentations1)
-                outputs_2= model(augmented_images2)
-                outputs_2_restored = inverse_augmentation(outputs_2, augmentations2)
-                consistency_loss =  torch.mean((outputs_1_restored - outputs_2_restored) ** 2)
-            unsupervised_loss += consistency_loss.item()
+            # 保持训练模式，去掉 no_grad，使梯度可传播
+            augmented_images1, augmentations1 = get_random_augmentation(images)
+            augmented_images2, augmentations2 = get_random_augmentation(images)
 
-        # 将有标签和无标签数据的损失加权合并
-        total_loss = total_loss + unsupervised_loss
+            outputs_1 = model(augmented_images1)
+            outputs_1_restored = inverse_augmentation(outputs_1, augmentations1)
 
-        print(f"Epoch [{epoch + 1}/{num_epochs_phase}], Loss: {total_loss / (len(train_loader)+len(train_unsupervised_loader)):.4f}")
+            outputs_2 = model(augmented_images2)
+            outputs_2_restored = inverse_augmentation(outputs_2, augmentations2)
 
-        # 验证步骤
+            consistency_loss = torch.mean((outputs_1_restored - outputs_2_restored) ** 2)
+
+            optimizer.zero_grad()
+            consistency_loss.backward()
+            optimizer.step()
+
+            total_loss += consistency_loss.item()  # 可选：加权 total_loss += 0.5 * consistency_loss.item()
+
+        scheduler.step()
+
+        avg_loss = total_loss / (len(train_loader) + len(train_unsupervised_loader))
+        print(f"Epoch [{epoch + 1}/{num_epochs_phase}], Loss: {avg_loss:.4f}")
+
+        # ===================== 验证步骤 =====================
         model.eval()
         total_val_loss = 0
         total_mean_dice = 0
         with torch.no_grad():
             for images, masks in val_loader:
                 images = images.to(device)
-                if masks is not None:
-                    masks = masks.to(device)
+                masks = masks.to(device)
 
-                output1,output2,output3,output4= model(images)
-                outputs=output1+output2+output3+output4
-                val_loss = supervised_loss(outputs, masks)  # 计算验证集上的损失
+                output1, output2, output3, output4 = model(images)
+                outputs = output1 + output2 + output3 + output4
+
+                val_loss = supervised_loss(outputs, masks)
                 total_val_loss += val_loss.item()
 
-                mean_dice = calculate_mean_dice(outputs, masks)  # 计算 Mean Dice
+                mean_dice = calculate_mean_dice(outputs, masks)
                 total_mean_dice += mean_dice.item()
-                print(f"Validation Loss: {total_val_loss / len(val_loader):.4f}, Mean Dice: {total_mean_dice / len(val_loader):.4f}")
-                # 保存验证集上表现最好的模型
-                if total_mean_dice / len(val_loader) > fold_best_mean_dice:
-                    fold_best_mean_dice = total_mean_dice / len(val_loader)
-                    torch.save(model.state_dict(), fold_model_path)
-                    print(f"Best model saved for fold {fold + 1} at epoch {epoch + 1}")
-                    torch.save(model.state_dict(), fold_last_model_path)
+
+            avg_val_loss = total_val_loss / len(val_loader)
+            avg_mean_dice = total_mean_dice / len(val_loader)
+            print(f"Validation Loss: {avg_val_loss:.4f}, Mean Dice: {avg_mean_dice:.4f}")
+
+            # 保存最佳模型
+            if avg_mean_dice > fold_best_mean_dice:
+                fold_best_mean_dice = avg_mean_dice
+                torch.save(model.state_dict(), fold_model_path)
+                print(f"Best model saved for fold {fold + 1} at epoch {epoch + 1}")
+
+        # 保存每轮最后模型
+        torch.save(model.state_dict(), fold_last_model_path)
+
 
 
 
